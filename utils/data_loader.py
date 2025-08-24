@@ -28,17 +28,17 @@ class CachedTSMixupLoader:
         self.num_workers = num_workers or mp.cpu_count()
         self.cache_dir = cache_dir
         
-        print(f"🔧 Initialized TSMixup loader:")
-        print(f"  Context length: {context_length}")
-        print(f"  Prediction length: {prediction_length}")
-        print(f"  Workers: {self.num_workers}")
-        print(f"  Cache dir: {cache_dir}")
+        # print(f"🔧 Initialized TSMixup loader:")
+        # print(f"  Context length: {context_length}")
+        # print(f"  Prediction length: {prediction_length}")
+        # print(f"  Workers: {self.num_workers}")
+        # print(f"  Cache dir: {cache_dir}")
 
     def load_cached_dataset(self, max_samples=None, force_redownload=False):
         """
         Load the TSMixup dataset from cache (streaming=False)
         """
-        print("📥 Loading TSMixup dataset from cache...")
+        # print("📥 Loading TSMixup dataset from cache...")
         start_time = time.time()
         
         # Load with streaming=False for better performance
@@ -51,12 +51,12 @@ class CachedTSMixupLoader:
         )
         
         load_time = time.time() - start_time
-        print(f"✅ Dataset loaded in {load_time:.2f} seconds")
-        print(f"📊 Total samples in dataset: {len(dataset):,}")
+        # print(f"✅ Dataset loaded in {load_time:.2f} seconds")
+        # print(f"📊 Total samples in dataset: {len(dataset):,}")
         
         if max_samples:
             total_samples = min(len(dataset), max_samples)
-            print(f"🎯 Will process {total_samples:,} samples")
+            # print(f"🎯 Will process {total_samples:,} samples")
         else:
             total_samples = len(dataset)
         
@@ -193,8 +193,8 @@ class CachedTSMixupLoader:
             # batches = []
             return all_processed_data, failed_count
 
-        print(f"🔄 Processing {total_samples:,} samples with {self.num_workers} workers...")
-        print(f"📦 Batch size: {batch_size}")
+        # print(f"🔄 Processing {total_samples:,} samples with {self.num_workers} workers...")
+        # print(f"📦 Batch size: {batch_size}")
         
         start_time = time.time()
         
@@ -205,7 +205,7 @@ class CachedTSMixupLoader:
         for i in range(0, total_samples, batch_size):
             end_idx = min(i + batch_size, total_samples)
             current_memory = psutil.Process().memory_info().rss
-            print(f"{i}: {current_memory / 1e9}")
+            # print(f"{i}: {current_memory / 1e9}")
             
             # Extract batch data from cached dataset (fast random access)
             batch_data = [dataset[j] for j in range(i, end_idx)]
@@ -219,7 +219,7 @@ class CachedTSMixupLoader:
             batches.append(batch_info)
 
             if ((i // batch_size + 1) % (self.num_workers)) == 0:
-                print(f"processing batches {len(batches)}")
+                # print(f"processing batches {len(batches)}")
                 processed_batches, failed_num = parallel_process(batches)
                 failed_count += failed_num
                 all_processed_data.extend(processed_batches)
@@ -232,7 +232,7 @@ class CachedTSMixupLoader:
         failed_count += failed_num        
         all_processed_data.extend(processed_batches)
         
-        print(f"📊 Created {len(batches)} batches for processing")
+        # print(f"📊 Created {len(batches)} batches for processing")
         
         
         
@@ -243,12 +243,12 @@ class CachedTSMixupLoader:
         processing_time = time.time() - start_time
         
         # Print statistics
-        print(f"\n🎉 PROCESSING COMPLETE:")
-        print(f"  ✅ Successfully processed: {len(final_data):,} samples")
-        print(f"  ❌ Failed samples: {failed_count:,}")
-        print(f"  📈 Success rate: {len(final_data)/(len(final_data)+failed_count)*100:.1f}%")
-        print(f"  ⏱️  Processing time: {processing_time:.2f} seconds")
-        print(f"  🚀 Processing speed: {len(final_data)/processing_time:.1f} samples/second")
+        # print(f"\n🎉 PROCESSING COMPLETE:")
+        # print(f"  ✅ Successfully processed: {len(final_data):,} samples")
+        # print(f"  ❌ Failed samples: {failed_count:,}")
+        # print(f"  📈 Success rate: {len(final_data)/(len(final_data)+failed_count)*100:.1f}%")
+        # print(f"  ⏱️  Processing time: {processing_time:.2f} seconds")
+        # print(f"  🚀 Processing speed: {len(final_data)/processing_time:.1f} samples/second")
         
         # Save processed data if requested
         if save_path:
@@ -258,7 +258,7 @@ class CachedTSMixupLoader:
     
     def _save_processed_data(self, data, save_path, processing_time):
         """Save processed data to disk"""
-        print(f"💾 Saving processed data to {save_path}...")
+        # print(f"💾 Saving processed data to {save_path}...")
         
         save_data = {
             'data': data,
@@ -276,7 +276,7 @@ class CachedTSMixupLoader:
         
         # Get file size
         file_size = os.path.getsize(save_path) / (1024 * 1024)  # MB
-        print(f"✅ Saved! File size: {file_size:.1f} MB")
+        # print(f"✅ Saved! File size: {file_size:.1f} MB")
 
 
 class CachedTSMixupDataset(Dataset):
@@ -292,8 +292,8 @@ class CachedTSMixupDataset(Dataset):
         self.patch_stride = patch_stride
         self.augmentation = augmentation
         
-        print(f"🏗️  Dataset created with {len(self.data):,} samples")
-        print(f"📊 Augmentation: {'ON' if augmentation else 'OFF'}")
+        # print(f"🏗️  Dataset created with {len(self.data):,} samples")
+        # print(f"📊 Augmentation: {'ON' if augmentation else 'OFF'}")
         
         if len(self.data) > 0:
             self._compute_statistics()
@@ -307,10 +307,10 @@ class CachedTSMixupDataset(Dataset):
         lengths = [len(ts) for ts in sample_data]
         all_values = np.concatenate(sample_data[:100])  # Even smaller sample for values
         
-        print(f"📈 Dataset Statistics (from {sample_size} samples):")
-        print(f"  Sequence lengths: min={min(lengths)}, max={max(lengths)}, mean={np.mean(lengths):.0f}")
-        print(f"  Value ranges: min={all_values.min():.4f}, max={all_values.max():.4f}")
-        print(f"  Value stats: mean={all_values.mean():.4f}, std={all_values.std():.4f}")
+        # print(f"📈 Dataset Statistics (from {sample_size} samples):")
+        # print(f"  Sequence lengths: min={min(lengths)}, max={max(lengths)}, mean={np.mean(lengths):.0f}")
+        # print(f"  Value ranges: min={all_values.min():.4f}, max={all_values.max():.4f}")
+        # print(f"  Value stats: mean={all_values.mean():.4f}, std={all_values.std():.4f}")
 
     def __len__(self):
         return len(self.data)
@@ -348,15 +348,15 @@ class CachedTSMixupDataset(Dataset):
     @classmethod
     def load_from_cache(cls, cache_path, augmentation=True):
         """Load preprocessed dataset from cache file"""
-        print(f"📂 Loading preprocessed dataset from {cache_path}...")
+        # print(f"📂 Loading preprocessed dataset from {cache_path}...")
         
         with open(cache_path, 'rb') as f:
             cached_data = pickle.load(f)
         
-        print(f"✅ Loaded cached data:")
-        print(f"  Samples: {cached_data['num_samples']:,}")
-        print(f"  Created: {cached_data.get('created_at', 'Unknown')}")
-        print(f"  Processing time: {cached_data.get('processing_time', 0):.2f}s")
+        # print(f"✅ Loaded cached data:")
+        # print(f"  Samples: {cached_data['num_samples']:,}")
+        # print(f"  Created: {cached_data.get('created_at', 'Unknown')}")
+        # print(f"  Processing time: {cached_data.get('processing_time', 0):.2f}s")
         
         return cls(
             preprocessed_data=cached_data['data'],
@@ -390,8 +390,8 @@ def create_cached_tsmixup_datasets(max_samples=100000, context_length=512,
         tuple: (train_dataset, val_dataset)
     """
     
-    print("🚀 CREATING CACHED TSMIXUP DATASETS")
-    print("=" * 50)
+    # print("🚀 CREATING CACHED TSMIXUP DATASETS")
+    # print("=" * 50)
     
     # Set default processed cache path
     if processed_cache_path is None:
@@ -399,18 +399,18 @@ def create_cached_tsmixup_datasets(max_samples=100000, context_length=512,
     
     # Check if processed data already exists
     if os.path.exists(processed_cache_path) and not force_reprocess:
-        print(f"📂 Found existing processed data at {processed_cache_path}")
+        # print(f"📂 Found existing processed data at {processed_cache_path}")
         try:
             # Load from existing processed cache
-            print("⚡ Loading preprocessed data from cache...")
+            # print("⚡ Loading preprocessed data from cache...")
             
             with open(processed_cache_path, 'rb') as f:
                 cached_data = pickle.load(f)
             
             processed_data = cached_data['data']
             
-            print(f"✅ Loaded {len(processed_data):,} preprocessed samples")
-            print(f"📅 Cache created: {cached_data.get('created_at', 'Unknown')}")
+            # print(f"✅ Loaded {len(processed_data):,} preprocessed samples")
+            # print(f"📅 Cache created: {cached_data.get('created_at', 'Unknown')}")
             
         except Exception as e:
             print(f"❌ Error loading cache: {e}")
@@ -450,13 +450,13 @@ def create_cached_tsmixup_datasets(max_samples=100000, context_length=512,
     if len(processed_data) == 0:
         raise ValueError("No valid samples found in dataset!")
     
-    print(f"\n📊 DATASET SUMMARY:")
-    print(f"  Total processed samples: {len(processed_data):,}")
-    print(f"  Context length: {context_length}")
-    print(f"  Prediction length: {prediction_length}")
+    # print(f"\n📊 DATASET SUMMARY:")
+    # print(f"  Total processed samples: {len(processed_data):,}")
+    # print(f"  Context length: {context_length}")
+    # print(f"  Prediction length: {prediction_length}")
     
     # Shuffle data for better train/val split
-    print("🔀 Shuffling data...")
+    # print("🔀 Shuffling data...")
     np.random.seed(42)  # For reproducible splits
     shuffled_indices = np.random.permutation(len(processed_data))
     shuffled_data = [processed_data[i] for i in shuffled_indices]
@@ -466,13 +466,13 @@ def create_cached_tsmixup_datasets(max_samples=100000, context_length=512,
     train_data = shuffled_data[:split_point]
     val_data = shuffled_data[split_point:]
     
-    print(f"📈 Data split:")
-    print(f"  Training samples: {len(train_data):,}")
-    print(f"  Validation samples: {len(val_data):,}")
-    print(f"  Train ratio: {len(train_data)/len(shuffled_data)*100:.1f}%")
+    # print(f"📈 Data split:")
+    # print(f"  Training samples: {len(train_data):,}")
+    # print(f"  Validation samples: {len(val_data):,}")
+    # print(f"  Train ratio: {len(train_data)/len(shuffled_data)*100:.1f}%")
     
-    # Create dataset objects
-    print("🏗️  Creating PyTorch datasets...")
+    # # Create dataset objects
+    # print("🏗️  Creating PyTorch datasets...")
     
     train_dataset = CachedTSMixupDataset(
         preprocessed_data=train_data,
@@ -488,19 +488,19 @@ def create_cached_tsmixup_datasets(max_samples=100000, context_length=512,
         augmentation=False  # Disable augmentation for validation
     )
     
-    print("\n🎉 DATASETS CREATED SUCCESSFULLY!")
-    print(f"✅ Train dataset: {len(train_dataset):,} samples")
-    print(f"✅ Validation dataset: {len(val_dataset):,} samples")
+    # print("\n🎉 DATASETS CREATED SUCCESSFULLY!")
+    # print(f"✅ Train dataset: {len(train_dataset):,} samples")
+    # print(f"✅ Validation dataset: {len(val_dataset):,} samples")
     
-    # Test datasets by loading a few samples
-    print("\n🧪 Testing dataset loading...")
+    # # Test datasets by loading a few samples
+    # print("\n🧪 Testing dataset loading...")
     try:
         train_sample = train_dataset[0]
         val_sample = val_dataset[0]
         
-        print(f"✅ Sample shapes:")
-        print(f"  Train - Past: {train_sample['past_values'].shape}, Future: {train_sample['future_values'].shape}")
-        print(f"  Val   - Past: {val_sample['past_values'].shape}, Future: {val_sample['future_values'].shape}")
+        # print(f"✅ Sample shapes:")
+        # print(f"  Train - Past: {train_sample['past_values'].shape}, Future: {train_sample['future_values'].shape}")
+        # print(f"  Val   - Past: {val_sample['past_values'].shape}, Future: {val_sample['future_values'].shape}")
         
     except Exception as e:
         print(f"❌ Error testing datasets: {e}")

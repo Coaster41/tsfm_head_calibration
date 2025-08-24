@@ -3,7 +3,6 @@ import glob
 from typing import List, Tuple, Optional, Dict, Any
 import torch
 from torch.utils.data import Dataset, DataLoader
-import timesfm
 import os
 import psutil
 import time
@@ -89,6 +88,7 @@ def reconstruct_quantiles_from_full(
     
 if __name__ == "__main__":
     # Full latents (token-level)
+    import timesfm
 
     pred_len = 96
     context_len = 512
