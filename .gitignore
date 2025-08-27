@@ -3,3 +3,5 @@ models/*
 __pycache__/*
 data/*
 *.pyc
+model_results/*
+analysis_cache/*

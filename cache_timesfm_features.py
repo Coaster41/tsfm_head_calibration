@@ -256,9 +256,10 @@ def cache_timesfm_features(
         elif mode == 'pred_mask':
             lat = transformer_output[prediction_mask].reshape([batch_size, -1, transformer_output.shape[-1]])
             lat = lat.to(dtype=to_dtype).cpu().contiguous()  # [B, D]
-            stats = stats[prediction_mask].reshape([batch_size, -1, stats.shape[-1]])  # [B, D]
+            stats = stats[prediction_mask].reshape([batch_size, 0, stats.shape[-1]])  # [B, D]
         elif mode == "last_ctx":
             lat = transformer_output[:,context_len//output_patch_len-1,:].to(dtype=to_dtype).cpu().contiguous()  # [B, D]
+            stats = stats[:,0,:]
         elif mode == "squeeze":
             lat = transformer_output.to(dtype=to_dtype).contiguous()  # [B, N, 1280]
         else:
@@ -359,7 +360,7 @@ if __name__ == "__main__":
     # device = torch.device(f"cuda:{local_rank % torch.cuda.device_count()}") 
     device = f"cuda:{local_rank % torch.cuda.device_count()}"
 
-    model_name = "yinglong"
+    model_name = "timesfm"
     if model_name == "timesfm":
         import timesfm
         pred_len = 128
@@ -469,22 +470,22 @@ if __name__ == "__main__":
     # )
 
     # # 3) Last patch cache
-    # cache_timesfm_features(
-    #     model=model,
-    #     dataset=train_dataset,
-    #     out_dir="./data/timesfm_cache_last_fp16",
-    #     mode="last",
-    #     batch_size=512,
-    #     num_workers=0,
-    #     target_shard_bytes=500 * 1024**2,  # ~500 MB shards
-    #     verify_equivalence=False,         # ensures process_transformer_output == quantile_forecasts
-    #     output_patch_len=128,
-    #     output_dim=10,
-    #     latent_dim=1280,
-    #     to_dtype=torch.float16,
-    #     device=device,
-    #     pin_memory=False,
-    # )
+    cache_timesfm_features(
+        model=model,
+        dataset=train_dataset,
+        out_dir="./data/timesfm_cache_last_fp16",
+        mode="last",
+        batch_size=512,
+        num_workers=0,
+        target_shard_bytes=500 * 1024**2,  # ~500 MB shards
+        verify_equivalence=False,         # ensures process_transformer_output == quantile_forecasts
+        output_patch_len=128,
+        output_dim=10,
+        latent_dim=1280,
+        to_dtype=torch.float16,
+        device=device,
+        pin_memory=False,
+    )
     
     # 4) MOIRAI pred_mask patch cache
     # cache_timesfm_features(
@@ -505,7 +506,7 @@ if __name__ == "__main__":
     #     model_name=model_name
     # )
 
-    # # 5) MOIRAI2 last_ctx patch cache
+    # 5) MOIRAI2 last_ctx patch cache
     # cache_timesfm_features(
     #     model=model,
     #     dataset=train_dataset,
@@ -524,7 +525,7 @@ if __name__ == "__main__":
     #     model_name=model_name
     # )
 
-    # 5) chronos_bolt squueze patch cache
+    # 5) chronos_bolt squeeze patch cache
     # cache_timesfm_features(
     #     model=model,
     #     dataset=train_dataset,
@@ -563,22 +564,22 @@ if __name__ == "__main__":
     #     inferred_N=4,
     # )
 
-    # 6) YingLong full patch cache
-    cache_timesfm_features(
-        model=model,
-        dataset=train_dataset,
-        out_dir="./data/yinglong_cache_fp16",
-        mode="full",
-        batch_size=512,
-        num_workers=0,
-        target_shard_bytes=500 * 1024**2,  # ~500 MB shards
-        verify_equivalence=False,         # ensures process_transformer_output == quantile_forecasts
-        output_patch_len=32,
-        output_dim=10,
-        latent_dim=768,
-        to_dtype=torch.float16,
-        device=device,
-        pin_memory=False,
-        model_name=model_name,
-        inferred_N=4,
-    )
+    # # 6) YingLong full patch cache
+    # cache_timesfm_features(
+    #     model=model,
+    #     dataset=train_dataset,
+    #     out_dir="./data/yinglong_cache_fp16",
+    #     mode="full",
+    #     batch_size=512,
+    #     num_workers=0,
+    #     target_shard_bytes=500 * 1024**2,  # ~500 MB shards
+    #     verify_equivalence=False,         # ensures process_transformer_output == quantile_forecasts
+    #     output_patch_len=32,
+    #     output_dim=10,
+    #     latent_dim=768,
+    #     to_dtype=torch.float16,
+    #     device=device,
+    #     pin_memory=False,
+    #     model_name=model_name,
+    #     inferred_N=4,
+    # )
