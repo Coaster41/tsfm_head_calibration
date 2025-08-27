@@ -103,7 +103,7 @@ def parse_args():
     parser.add_argument("--dataset", type=str, required=True,
                         help="Path to CSV with columns [unique_id, ds, y].")
     parser.add_argument("--pred-length", type=int, default=64,
-                        help="Prediction horizon.")
+                        help="Prediction horizon. Only crops output to this size")
     parser.add_argument("--context-len", type=int, default=512,
                         help="Context length.")
     parser.add_argument("--forecast-date", type=str, default="2021-01-31 23:00:00",
@@ -123,7 +123,7 @@ def parse_args():
                         help="Heads to evaluate; 'backbone' is added automatically.")
     parser.add_argument("--horizon-len", type=int, required=False,
                         default=None,
-                        help="Sets a strict forecast horizon length")
+                        help="Sets a strict forecast horizon length (overwrites step size for models)")
     # Redundant...
     parser.add_argument("--include-backbone", action="store_true", default=True, 
                         help="Include 'backbone' as a pseudo-head for baseline forecasts.")

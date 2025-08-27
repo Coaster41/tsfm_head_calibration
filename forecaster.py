@@ -625,3 +625,161 @@ class HeadForecaster:
         heads_out["backbone"] = backbone_out
 
         return heads_out
+    
+
+    def autoregressive_forecast(
+        self,
+        context: Tensor,
+        pred_len: int,
+        step_len: int,
+        heads: Optional[List[str]] = None,
+    ) -> Dict[str, Dict[str, Tensor]]:
+        """
+        Autoregressive multi-quantile forecasting.
+
+        Args:
+          context: [B, context_len] float tensor
+          pred_len: total forecast length to generate (> step_len)
+          step_len: AR step size (<= self.cfg.horizon_len)
+          heads: which heads to use (same semantics as forecast). If None, uses loaded heads.
+                 As in `forecast`, the returned dict will always include a "backbone" entry.
+
+        Returns:
+          Dict[str, Dict[str, Tensor]] mapping:
+            {
+              head_type (incl. "backbone"): {
+                "mean":      [B, pred_len] (CPU tensor),
+                "median":    [B, pred_len] (CPU tensor),
+                "quantiles": [Q, B, pred_len] (CPU tensor),
+              },
+              ...
+            }
+        """
+        # Basic checks
+        assert context.ndim == 2 and context.shape[1] == self.cfg.context_len, \
+            f"context must be [B, {self.cfg.context_len}]"
+        if not (1 <= step_len <= self.cfg.horizon_len):
+            raise ValueError(f"step_len must be in [1, {self.cfg.horizon_len}], got {step_len}")
+        if not (pred_len > 0 and pred_len >= step_len):
+            raise ValueError(f"pred_len must be >= step_len (> 0). Got pred_len={pred_len}, step_len={step_len}")
+
+        B = context.shape[0]
+        Qs = self.quantiles
+        Q = len(Qs)
+        # Find index of 0.5 (or nearest) for median extraction
+        try:
+            median_idx = Qs.index(0.5)
+        except ValueError:
+            median_idx = min(range(Q), key=lambda i: abs(Qs[i] - 0.5))
+
+        # 1) Initial forecast on the original context (one call)
+        base_out = self.forecast(context, heads=heads)
+
+        # Determine which entries to produce AR for (always include backbone)
+        # base_out contains at least "backbone"; and potentially additional heads
+        run_keys = [k for k in base_out.keys() if k == "backbone" or (heads is None or k in heads)]
+
+        # Storage for AR outputs
+        ar_quant_chunks: Dict[str, List[Tensor]] = {k: [] for k in run_keys}   # list of [Q, B, chunk_len]
+        ar_mean_chunks: Dict[str, List[Tensor]] = {k: [] for k in run_keys}    # list of [B, chunk_len]
+
+        # 2) Build q contexts per head by appending first step_len quantile paths from the initial forecast
+        #    Also, store the first chunk outputs from base_out.
+        # contexts_per_key: key -> contexts tensor of shape [Q, B, context_len]
+        contexts_per_key: Dict[str, Tensor] = {}
+
+        first_chunk_len = min(step_len, pred_len)
+        for key in run_keys:
+            bo = base_out[key]
+            # bo["quantiles"]: [Q, B, H]
+            q_init = bo["quantiles"][:, :, :first_chunk_len].detach().cpu()          # [Q, B, step_len or remaining]
+            mean_init = bo["mean"][:, :first_chunk_len].detach().cpu()               # [B, chunk]
+            # Store outputs for the first chunk directly from the initial forecast
+            ar_quant_chunks[key].append(q_init)
+            ar_mean_chunks[key].append(mean_init)
+
+            # Build q contexts for this key by appending each quantile path
+            # Shift context by first_chunk_len and append q_init[k] for each k
+            # Resulting shape: [Q, B, context_len]
+            shifted = context[:, first_chunk_len:]  # [B, C - first_chunk_len]
+            q_contexts = []
+            for k in range(Q):
+                q_ctx_k = torch.cat([shifted, q_init[k].to(context.dtype)], dim=1)
+                q_contexts.append(q_ctx_k)
+            contexts_per_key[key] = torch.stack(q_contexts, dim=0)  # [Q, B, context_len]
+
+        generated = first_chunk_len
+
+        # Helper for quantile aggregation across q^2 grid
+        def aggregate_q2_to_q(q2_grid: Tensor) -> Tensor:
+            """
+            q2_grid: [Q_pred, Q_scen, B, L] -> aggregate across the first two dims (Q_pred*Q_scen)
+            returns: [Q, B, L]
+            """
+            # Flatten (Q_pred, Q_scen) into samples dim
+            samples = q2_grid.reshape(Q * Q, B, q2_grid.shape[-1])  # [Q*Q, B, L]
+            # quantile over dim=0 (the "samples" dimension)
+            probs = torch.tensor(Qs, dtype=samples.dtype, device=samples.device)
+            # Output: [Q, B, L]
+            return torch.quantile(samples, probs, dim=0)
+
+        # 3-5) AR loop until we reach pred_len
+        while generated < pred_len:
+            chunk_len = min(step_len, pred_len - generated)
+            for key in run_keys:
+                # Prepare batch contexts [Q*B, context_len]
+                q_contexts = contexts_per_key[key]               # [Q, B, C]
+                qb, C = q_contexts.shape[0] * q_contexts.shape[1], q_contexts.shape[2]
+                contexts_batch = q_contexts.reshape(qb, C)       # [Q*B, C]
+
+                # Forecast on these q contexts for this specific key
+                # - If key == "backbone": no extra heads -> pass heads=[]
+                # - Else: pass heads=[key] to only compute that head (backbone will still be in output; we will select the needed key)
+                if key == "backbone":
+                    out = self.forecast(contexts_batch, heads=[])
+                else:
+                    out = self.forecast(contexts_batch, heads=[key])
+
+                # Select the right entry
+                this_out = out["backbone"] if key == "backbone" else out[key]
+
+                # Quantiles: [Q_pred, Q*B, H] -> view as [Q_pred, Q_scen, B, H]
+                q_pred_full = this_out["quantiles"][:, :, :chunk_len].detach().cpu()  # [Q, Q*B, chunk_len]
+                q_pred = q_pred_full.reshape(Q, Q, B, chunk_len)                      # [Q_pred, Q_scen, B, chunk_len]
+
+                # 4) Aggregate q^2 -> q quantiles
+                q_agg = aggregate_q2_to_q(q_pred)  # [Q, B, chunk_len]
+
+                # Mean aggregation: average the per-scenario means
+                # this_out["mean"]: [Q*B, H] -> [Q, B, H] -> slice [:chunk_len] -> [Q, B, chunk_len]
+                means_full = this_out["mean"][:, :chunk_len].detach().cpu().reshape(Q, B, chunk_len)
+                mean_agg = means_full.mean(dim=0)  # [B, chunk_len]
+
+                # Store chunk
+                ar_quant_chunks[key].append(q_agg)
+                ar_mean_chunks[key].append(mean_agg)
+
+                # 5) Update each scenario context by appending the aggregated quantile for that scenario (k)
+                # Slide by chunk_len to keep context length constant.
+                new_q_contexts = []
+                for k in range(Q):
+                    prev_ctx_k = q_contexts[k]  # [B, context_len]
+                    ctx_k_next = torch.cat([prev_ctx_k[:, chunk_len:], q_agg[k].to(prev_ctx_k.dtype)], dim=1)
+                    new_q_contexts.append(ctx_k_next)
+                contexts_per_key[key] = torch.stack(new_q_contexts, dim=0)  # [Q, B, context_len]
+
+            generated += chunk_len
+
+        # 6) Collate chunks into final tensors for each key
+        ar_results: Dict[str, Dict[str, Tensor]] = {}
+        for key in run_keys:
+            # Concatenate along the time dimension
+            q_all = torch.cat(ar_quant_chunks[key], dim=2)  # [Q, B, pred_len]
+            m_all = torch.cat(ar_mean_chunks[key], dim=1)   # [B, pred_len]
+            ar_results[key] = {
+                "mean": m_all,                 # [B, pred_len]
+                "median": q_all[median_idx],   # [B, pred_len]
+                "quantiles": q_all,            # [Q, B, pred_len]
+            }
+
+        return ar_results
