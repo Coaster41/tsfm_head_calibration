@@ -22,6 +22,7 @@ from uni2ts.distribution import (
 from uni2ts.distribution.negative_binomial import NegativeBinomial
 from scipy.special import stdtrit
 from scipy.stats import (poisson, nbinom)
+import math
 
 # Reuse eps and latent_forecast + MixtureHead from the trainer script or define here
 eps = 1e-6
@@ -328,10 +329,12 @@ class HeadForecaster:
         model_name = self.cfg.model_name
         device = self.device
         context_len = self.cfg.context_len
+        pred_len = self.cfg.horizon_len
 
         if model_name == "timesfm":
             import timesfm
-            pred_len = self.cfg.horizon_len
+            if pred_len != 128: # pred_len is not default: Error out
+                raise ValueError(F"pred_len for TimesFM must be 128, it is set as {pred_len}")
             model = timesfm.TimesFm(
                 hparams=timesfm.TimesFmHparams(
                     backend='gpu' if device.type == "cuda" else 'cpu',
@@ -353,7 +356,6 @@ class HeadForecaster:
 
         elif model_name == "moirai2":
             from uni2ts.model.moirai2 import (Moirai2Forecast, Moirai2Module)
-            pred_len = self.cfg.horizon_len
             model = Moirai2Forecast(
                 module=Moirai2Module.from_pretrained("Salesforce/moirai-2.0-R-small"),
                 prediction_length=pred_len,
@@ -362,10 +364,15 @@ class HeadForecaster:
                 feat_dynamic_real_dim=0,
                 past_feat_dynamic_real_dim=0,
             )
+            if pred_len != 64: # pred_len is not default: Changing the AR step size
+                num_predict_token = math.ceil(pred_len / self.PATCH_LEN[model_name])
+                model.module.num_predict_token = num_predict_token
             model.module.eval()
             model.module.to(device)
 
         elif model_name == "chronos_bolt":
+            if pred_len != 64: # pred_len is not default: Error out
+                raise ValueError(F"pred_len for Chronos_Bolt must be 64, it is set as {pred_len}")
             from chronos import ChronosBoltPipeline
             model = ChronosBoltPipeline.from_pretrained(
                 "amazon/chronos-bolt-base",
@@ -411,8 +418,8 @@ class HeadForecaster:
             _, quantile_forecasts, (transformer_output, stats) = model.forecast(
                 context, freq=freq, get_stacked_transformer=True
             )
-            transformer_output = transformer_output[:, -1, :]
-            quantile_forecasts = quantile_forecasts[:, :, 1:]
+            transformer_output = transformer_output[:, -1, :].detach().cpu()
+            quantile_forecasts = torch.tensor(quantile_forecasts[:, :, 1:])
 
         elif "moirai" in model_name:
             context_ = context.to(device)[:, :, None]
@@ -431,7 +438,7 @@ class HeadForecaster:
                 target, observed_mask, sample_id, time_id, variate_id, prediction_mask, patch_sizes
             )
             transformer_output = transformer_output[:,context_len//patch_len-1,:].detach().cpu()
-            stats = stats[:,0,:]
+            stats = stats[:,0,:].detach().cpu()
             model.module.get_reprs = False
             forecasts = model.module(target, observed_mask, sample_id, time_id, variate_id, prediction_mask, patch_sizes)
             forecasts = einops.rearrange(forecasts[:,context_len//patch_len-1,:],
@@ -457,14 +464,14 @@ class HeadForecaster:
         elif model_name == "tirex":
             d_model = model.model_config.block_kwargs.embedding_dim
             patch_size = model.model_config.output_patch_size
-            out_patches = pred_len // patch_size
+            out_patches = math.ceil(pred_len / patch_size)
             transformer_output = torch.zeros(context.shape[0], out_patches, d_model)
             stats = torch.zeros((context.shape[0], 2))
             forecasts = model.forecast(context=context, prediction_length=pred_len, batch_size=batch_size,
-                                       max_accelerated_rollout_steps=4,
+                                       max_accelerated_rollout_steps=out_patches,
                                        get_loc_scale=stats,
                                        get_hidden_states=transformer_output)
-            quantile_forecasts = forecasts[0]
+            quantile_forecasts = forecasts[0].detach().cpu()
 
         elif model_name == "yinglong":
             context_ = context.to(device)
@@ -495,7 +502,7 @@ class HeadForecaster:
         else:
             raise KeyError(f"Unsupported model_name for forecasting: {model_name}")
 
-        return quantile_forecasts, transformer_output, stats
+        return quantile_forecasts, transformer_output, stats.detach().cpu()
 
     # ---------- Head loading/building ---------- #
 
@@ -692,8 +699,12 @@ class HeadForecaster:
         for key in run_keys:
             bo = base_out[key]
             # bo["quantiles"]: [Q, B, H]
-            q_init = bo["quantiles"][:, :, :first_chunk_len].detach().cpu()          # [Q, B, step_len or remaining]
-            mean_init = bo["mean"][:, :first_chunk_len].detach().cpu()               # [B, chunk]
+            if torch.is_tensor(bo["quantiles"]):
+                q_init = bo["quantiles"][:, :, :first_chunk_len].detach().cpu()          # [Q, B, step_len or remaining]
+                mean_init = bo["mean"][:, :first_chunk_len].detach().cpu()               # [B, chunk]
+            else:
+                q_init = torch.tensor(bo["quantiles"][:, :, :first_chunk_len])
+                mean_init = torch.tensor(bo["mean"][:, :first_chunk_len])
             # Store outputs for the first chunk directly from the initial forecast
             ar_quant_chunks[key].append(q_init)
             ar_mean_chunks[key].append(mean_init)
@@ -744,7 +755,10 @@ class HeadForecaster:
                 this_out = out["backbone"] if key == "backbone" else out[key]
 
                 # Quantiles: [Q_pred, Q*B, H] -> view as [Q_pred, Q_scen, B, H]
-                q_pred_full = this_out["quantiles"][:, :, :chunk_len].detach().cpu()  # [Q, Q*B, chunk_len]
+                if torch.is_tensor(this_out["quantiles"]):
+                    q_pred_full = this_out["quantiles"][:, :, :chunk_len].detach().cpu()  # [Q, Q*B, chunk_len]
+                else:
+                    q_pred_full = torch.tensor(this_out["quantiles"][:, :, :chunk_len])
                 q_pred = q_pred_full.reshape(Q, Q, B, chunk_len)                      # [Q_pred, Q_scen, B, chunk_len]
 
                 # 4) Aggregate q^2 -> q quantiles
@@ -752,7 +766,10 @@ class HeadForecaster:
 
                 # Mean aggregation: average the per-scenario means
                 # this_out["mean"]: [Q*B, H] -> [Q, B, H] -> slice [:chunk_len] -> [Q, B, chunk_len]
-                means_full = this_out["mean"][:, :chunk_len].detach().cpu().reshape(Q, B, chunk_len)
+                if torch.is_tensor(this_out["mean"]):
+                    means_full = this_out["mean"][:, :chunk_len].detach().cpu().reshape(Q, B, chunk_len)
+                else:
+                    means_full = torch.tensor(this_out["mean"][:, :chunk_len]).reshape(Q, B, chunk_len)
                 mean_agg = means_full.mean(dim=0)  # [B, chunk_len]
 
                 # Store chunk
@@ -769,6 +786,8 @@ class HeadForecaster:
                 contexts_per_key[key] = torch.stack(new_q_contexts, dim=0)  # [Q, B, context_len]
 
             generated += chunk_len
+            del out, this_out, q_pred_full, means_full
+            torch.cuda.empty_cache()
 
         # 6) Collate chunks into final tensors for each key
         ar_results: Dict[str, Dict[str, Tensor]] = {}

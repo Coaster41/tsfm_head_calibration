@@ -6,6 +6,7 @@ per-head predictions to CSVs.
 - Loads a long-format CSV with columns [unique_id, ds, y]
 - Builds a GluonTS PandasDataset and constructs rolling windows
 - Uses forecaster.HeadForecaster to load backbone + head checkpoints
+- Supports both single-call forecast and autoregressive (AR) forecast
 - For each head, collects median and quantile predictions and writes CSVs:
     save_dir/{head}/{median or q}_preds.csv
 
@@ -31,7 +32,10 @@ from gluonts.itertools import batcher
 
 # Your local module that wraps loading backbones and head checkpoints
 from forecaster import ForecastConfig, HeadForecaster
-QUANTILES = [10,20,30,40,50,60,70,80,90]
+
+# Column naming for quantiles in saved CSVs
+QUANTILES = [10, 20, 30, 40, 50, 60, 70, 80, 90]
+
 
 def load_test_data(
     pred_length: int,
@@ -87,23 +91,26 @@ def load_test_data(
     # Split to get test template starting at forecast_date_ts
     _, test_template = split(ds, date=pd.Period(forecast_date_ts, freq=freq))
 
+    print(f"Windows: {(total_forecast_length - PDT) // stride + 1}, total length: {total_forecast_length}")
+
     # Build rolling-window instances
     test_data = test_template.generate_instances(
-        prediction_length=PDT,                 # steps to predict
-        windows=(total_forecast_length - PDT) // stride,   # number of windows
-        distance=stride,                       # step between windows
+        prediction_length=PDT,                              # steps to predict / crop
+        windows=(total_forecast_length - PDT) // stride + 1,    # number of windows
+        distance=stride,                                    # step between windows
         max_history=CTX,
     )
     return test_data, freq, unit, freq_delta
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Rolling-window forecasting with saved heads.")
+    parser = argparse.ArgumentParser(description="Rolling-window forecasting with saved heads. Supports AR mode.")
     # Data/rolling window
     parser.add_argument("--dataset", type=str, required=True,
                         help="Path to CSV with columns [unique_id, ds, y].")
     parser.add_argument("--pred-length", type=int, default=64,
-                        help="Prediction horizon. Only crops output to this size")
+                        help="Total forecast length to emit in the CSV (crops model output to this length). "
+                             "In AR mode, this is the autoregressive total horizon.")
     parser.add_argument("--context-len", type=int, default=512,
                         help="Context length.")
     parser.add_argument("--forecast-date", type=str, default="2021-01-31 23:00:00",
@@ -123,9 +130,15 @@ def parse_args():
                         help="Heads to evaluate; 'backbone' is added automatically.")
     parser.add_argument("--horizon-len", type=int, required=False,
                         default=None,
-                        help="Sets a strict forecast horizon length (overwrites step size for models)")
+                        help="Sets a strict forecast horizon length per single call (overwrites model default).")
+    # AR controls
+    parser.add_argument("--ar", action="store_true", default=False,
+                        help="Enable autoregressive forecasting.")
+    parser.add_argument("--ar-step-len", type=int, default=None,
+                        help="AR step length per iteration (must be <= model horizon_len). "
+                             "If omitted, defaults to model step_size if available, else min(horizon_len, pred_length).")
     # Redundant...
-    parser.add_argument("--include-backbone", action="store_true", default=True, 
+    parser.add_argument("--include-backbone", action="store_true", default=True,
                         help="Include 'backbone' as a pseudo-head for baseline forecasts.")
     # Output
     parser.add_argument("--save-dir", type=str, required=True,
@@ -155,18 +168,40 @@ def main():
     cfg = ForecastConfig(
         model_name=args.model_name,
         context_len=args.context_len,
-        horizon_len=args.horizon_len,
+        horizon_len=args.horizon_len,  # may be None -> default per model; else fixed horizon per single call
         ckpt_dir=args.ckpt_dir,
         device=device_str,
     )
     forecaster = HeadForecaster(cfg)
 
     heads: List[str] = list(args.heads)
-    loaded_heads = forecaster.load_heads(heads)
+    # Important: do not try to load "backbone" as a head
+    heads_to_load = [h for h in heads if h != "backbone"]
+    loaded_heads = forecaster.load_heads(heads_to_load)
     print("Loaded heads:", loaded_heads)
 
     if args.include_backbone and "backbone" not in heads:
         heads.append("backbone")
+
+    # Resolve AR step length if AR mode is enabled
+    if args.ar:
+        # Prefer configured step_size; else clamp to min(horizon_len, pred_length)
+        if args.ar_step_len is not None:
+            ar_step_len = int(args.ar_step_len)
+            if ar_step_len > forecaster.cfg.horizon_len:
+                forecaster.cfg.horizon_len = ar_step_len
+        else:
+            if forecaster.cfg.step_size is not None:
+                ar_step_len = int(forecaster.cfg.step_size)
+            else:
+                # Fallback to horizon_len if set, else just pred_length
+                h = forecaster.cfg.horizon_len if forecaster.cfg.horizon_len is not None else args.pred_length
+                ar_step_len = int(min(h, args.pred_length))
+        if ar_step_len < 1:
+            raise ValueError("ar-step-len must be >= 1.")
+        if forecaster.cfg.horizon_len is not None and ar_step_len > forecaster.cfg.horizon_len:
+            raise ValueError(f"ar-step-len ({ar_step_len}) must be <= model horizon_len ({forecaster.cfg.horizon_len}).")
+        print(f"AR mode enabled: pred_len={args.pred_length}, step_len={ar_step_len}")
 
     # 3) Iterate over rolling windows in batches and forecast
     os.makedirs(args.save_dir, exist_ok=True)
@@ -180,9 +215,27 @@ def main():
         t0 = time.time()
         # context tensor shape [B, T]
         context = torch.stack([torch.tensor(entry["target"]) for entry in batch])
-        out = forecaster.forecast(context)  # dict: head -> {'median': [B,H], 'quantiles': [Q,B,H]}
 
-        print(f"batch {i}: single iteration: {time.time() - t0:.3f}s | total: {time.time() - start_time:.3f}s")
+        # Choose AR vs single-call forecasting
+        if args.ar:
+            # Pass heads excluding 'backbone'; AR returns "backbone" as well
+            req_heads = [h for h in heads if h != "backbone"]
+            out = forecaster.autoregressive_forecast(
+                context=context,
+                pred_len=args.pred_length,
+                step_len=ar_step_len,
+                heads=req_heads if len(req_heads) > 0 else None,
+            )
+        else:
+            # Single-call forecast; pass requested heads (excluding 'backbone') to match loaded heads
+            req_heads = [h for h in heads if h != "backbone"]
+            out = forecaster.forecast(
+                context=context,
+                heads=req_heads if len(req_heads) > 0 else None,
+            )
+
+        iter_type = "AR" if args.ar else "single"
+        print(f"batch {i}: {iter_type} iteration: {time.time() - t0:.3f}s | total: {time.time() - start_time:.3f}s")
 
         # The notebook stores item_id twice (both unique_id and ds). We keep this behavior for fidelity.
         item_id_col_batches.append(np.array([entry["item_id"] for entry in batch]))
@@ -220,14 +273,16 @@ def main():
             pred_types = pred_types[:min_len]
             head_forecasts = head_forecasts[:min_len]
 
+        # Robust cropping: save up to the requested pred_length or available horizon, whichever is smaller
+        H_avail = head_forecasts.shape[2]
+        horizon_to_save = min(args.pred_length, H_avail)
+
         for pred_type_ind, pred_type in enumerate(pred_types):
             data_dict = {
                 "unique_id": item_id_col,
                 "ds": start_date_col,
             }
-            # horizon = head_forecasts.shape[2]
-            horizon = args.pred_length
-            for step in range(horizon):
+            for step in range(horizon_to_save):
                 data_dict[str(step + 1)] = head_forecasts[pred_type_ind, :, step]
             df_out = pd.DataFrame(data_dict)
             out_path = os.path.join(head_dir, f"{pred_type}_preds.csv")
