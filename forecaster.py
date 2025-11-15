@@ -34,6 +34,75 @@ def mixture_quantiles_by_sampling(dist, qs, num_samples=4096):
         q_vals = torch.quantile(samples, q_tensor, dim=0)
     return q_vals
 
+def mixture_single_sample(dist):
+    with torch.no_grad():
+        samples = dist.sample((1,))
+    return samples[0]
+
+
+def sample_from_quantiles(q_pred: torch.Tensor,
+                                q_levels: torch.Tensor | None = None,
+                                clamp_tails: bool = False) -> torch.Tensor:
+    """
+    Convert uniform random samples U to samples from a distribution approximated by given quantiles.
+
+    Args:
+        q_pred: [Q, B, H] tensor of quantile values for levels q_levels.
+        q_levels: [Q] tensor of quantile levels (ascending). If None, assumes evenly spaced in (0,1)
+                  and infers as torch.linspace(1/(Q+1), Q/(Q+1), Q).
+        clamp_tails: if True, clamp u into [q_levels[0], q_levels[-1]]. If False, extrapolate linearly
+                     using the end segments.
+
+    Returns:
+        samples: [B, H] tensor of sampled values via piecewise-linear interpolation.
+    """
+    assert q_pred.ndim == 3, "q_pred must be [Q, B, H]"
+
+    Q, B, H = q_pred.shape
+
+    u = torch.rand(B, H) # "u shape must match [B, H] of q_pred"
+
+    if q_levels is None:
+        # For evenly spaced levels (e.g., 0.1..0.9), infer levels
+        q_levels = torch.linspace(1/(Q+1), Q/(Q+1), steps=Q, device=q_pred.device, dtype=q_pred.dtype)
+    else:
+        q_levels = q_levels.to(device=q_pred.device, dtype=q_pred.dtype)
+        assert q_levels.shape == (Q,), "q_levels must be [Q]"
+        # Ensure ascending
+        assert torch.all(q_levels[1:] >= q_levels[:-1]), "q_levels must be non-decreasing"
+
+    # Option A: clamp u into [min_level, max_level] (default)
+    if clamp_tails:
+        u_eff = u.to(device=q_pred.device, dtype=q_pred.dtype).clamp(min=q_levels[0].item(), max=q_levels[-1].item())
+    else:
+        # Option B: allow extrapolation — we keep u, but will cap bucket indices and interpolate beyond ends
+        u_eff = u.to(device=q_pred.device, dtype=q_pred.dtype)
+
+    # Find upper bucket index hi for each u: q_levels[lo] <= u < q_levels[hi] (right=True)
+    # searchsorted expects last dimension sorted; we provide a 1D vector q_levels.
+    idx_hi = torch.searchsorted(q_levels, u_eff, right=True)  # [B, H] in [0..Q]
+    # Constrain indices to [1..Q-1] so lo=hi-1 is valid within [0..Q-2]
+    idx_hi = idx_hi.clamp(min=1, max=Q-1)
+    idx_lo = idx_hi - 1  # [B, H]
+
+    # Gather q_pred at lo/hi quantile indices
+    # Prepare indices for gather along dim=0 (quantile axis)
+    idx_lo_g = idx_lo.unsqueeze(0)  # [1, B, H]
+    idx_hi_g = idx_hi.unsqueeze(0)  # [1, B, H]
+    v_lo = torch.gather(q_pred, dim=0, index=idx_lo_g)  # [1, B, H]
+    v_hi = torch.gather(q_pred, dim=0, index=idx_hi_g)  # [1, B, H]
+
+    # Interpolation weight alpha in [0,1] based on quantile levels
+    ql = q_levels[idx_lo]  # [B, H]
+    qh = q_levels[idx_hi]  # [B, H]
+    denom = (qh - ql).clamp_min(1e-8)
+    alpha = (u_eff - ql) / denom  # [B, H]
+
+    # Linear interpolation: v = (1 - alpha) * v_lo + alpha * v_hi
+    samples = torch.lerp(v_lo.squeeze(0), v_hi.squeeze(0), alpha)  # [B, H]
+    return samples
+    
+
 class MixtureHead(nn.Module):
     """
     Wrap a backbone (e.g., ResidualBlock) and a uni2ts DistrParamProj derived from MixtureOutput.
@@ -117,6 +186,7 @@ def latent_forecast(pred_head: nn.Module, latents: Tensor, horizon_len: int, hea
             results["median"] = pred[:, :, 4].detach().cpu()
             results["mean"] = pred[:, :, 4].detach().cpu()
             results["quantiles"] = einops.rearrange(pred.detach().cpu(), "B H Q -> Q B H")
+            results["samples"] = sample_from_quantiles(results["quantiles"], torch.tensor(quantiles))
             
     elif head_type == "mixture":
         assert mixture_output is not None, "mixture_output must be provided for head_type='mixture'"
@@ -167,12 +237,15 @@ def latent_forecast(pred_head: nn.Module, latents: Tensor, horizon_len: int, hea
                 # quantiles via sampling
                 median_quantiles = [0.5] + quantiles
                 q_vals = mixture_quantiles_by_sampling(dist, median_quantiles, num_samples=4096).cpu()  # [1+Q, B, H]
+                samples = mixture_single_sample(dist).cpu()
                 if n_patches > 0:
                     mean = einops.rearrange(mean, "(B patches) patch_len -> B (patches patch_len)", patches=n_patches)
                     q_vals = einops.rearrange(q_vals, "Q (B patches) patch_len -> Q B (patches patch_len)", patches=n_patches)
+                    samples = einops.rearrange(samples, "(B patches) patch_len -> B (patches patch_len)", patches=n_patches)
                 results["mean"] = mean
                 results["median"] = q_vals[0] 
                 results["quantiles"] = q_vals[1:]
+                results["samples"] = samples
 
     else: # distribution loss
         if head_type == "gaussian":
@@ -181,6 +254,17 @@ def latent_forecast(pred_head: nn.Module, latents: Tensor, horizon_len: int, hea
             if torch.is_tensor(mu0) and torch.is_tensor(sigma0):
                 pred_mu = pred_mu * sigma0[:, None] + mu0[:, None]
                 pred_std = pred_std * sigma0[:, None]
+
+            
+            if (pred_std.isnan().any()):
+                print("gaussian pred_std contains a nan")
+
+            # Sanitize head params
+            pred_std = torch.nan_to_num(pred_std, nan=1.0, posinf=1e6, neginf=1.0).clamp_min(1e-6).clamp_max(1e6)
+            pred_mu  = torch.nan_to_num(pred_mu,  nan=0.0, posinf=1e6, neginf=-1e6)
+
+            if (pred_std <= 0).any():
+                print("gaussian pred_std is less than or equal to zero")
             distribution = Normal(pred_mu, pred_std)
 
         elif head_type == "poisson":
@@ -207,6 +291,17 @@ def latent_forecast(pred_head: nn.Module, latents: Tensor, horizon_len: int, hea
             if torch.is_tensor(mu0) and torch.is_tensor(sigma0):
                 pred_mu = pred_mu * sigma0[:, None] + mu0[:, None]
                 pred_std = pred_std * sigma0[:, None]
+
+            if (pred_df.isnan().any()):
+                print("studentst pred_df contains a nan")
+
+            # Sanitize head params
+            pred_df  = torch.nan_to_num(pred_df,  nan=1.0, posinf=1e6, neginf=1.0).clamp_min(1e-6).clamp_max(1e6)
+            pred_std = torch.nan_to_num(pred_std, nan=1.0, posinf=1e6, neginf=1.0).clamp_min(1e-6).clamp_max(1e6)
+            pred_mu  = torch.nan_to_num(pred_mu,  nan=0.0, posinf=1e6, neginf=-1e6)
+
+            if (pred_df <= 0).any():
+                print("studentst pred_df is less than or equal to zero")
             distribution = StudentT(pred_df, loc=pred_mu, scale=pred_std)
         else:
             raise KeyError(f"{head_type} is not a valid distribution or loss")
@@ -218,6 +313,7 @@ def latent_forecast(pred_head: nn.Module, latents: Tensor, horizon_len: int, hea
             results["loss"] = loss
         if forecast:
             results["mean"] = distribution.mean.detach().cpu()
+            results["samples"] = distribution.sample().detach().cpu()
             if head_type in  ("studentst", "poisson", "neg_binom"):
                 median_quantiles = [0.5] + quantiles
                 p = torch.tensor(median_quantiles)[:, None, None] * \
@@ -588,6 +684,7 @@ class HeadForecaster:
                 "mean": backbone_mean,
                 "median": backbone_median,
                 "quantiles": backbone_quantiles,
+                "samples": sample_from_quantiles(backbone_quantiles)
             }
         else:
             raise RuntimeError("Backbone did not return quantile forecasts of shape [B, H, Q].")
@@ -802,3 +899,147 @@ class HeadForecaster:
             }
 
         return ar_results
+    
+    def autoregressive_forecast_samples(
+        self,
+        context: Tensor,
+        pred_len: int,
+        step_len: int,
+        n_samples: int,
+        heads: Optional[List[str]] = None,
+    ) -> Dict[str, Dict[str, Tensor]]:
+        """
+        Autoregressive forecasting by Monte Carlo sampling of full trajectories.
+
+        Args:
+          context: [B, context_len] float tensor
+          pred_len: total forecast length to generate (>= step_len)
+          step_len: AR step size (<= self.cfg.horizon_len)
+          n_samples: number of independent sample trajectories to generate per head
+          heads: which heads to use (same semantics as forecast). If None, uses loaded heads.
+                 The returned dict will always include a "backbone" entry.
+
+        Returns:
+          Dict[str, Dict[str, Tensor]] mapping:
+            {
+              head_type (incl. "backbone"): {
+                "mean":      [B, pred_len] (CPU tensor),
+                "median":    [B, pred_len] (CPU tensor),
+                "quantiles": [Q, B, pred_len] (CPU tensor),
+              },
+              ...
+            }
+        """
+        # Basic checks
+        assert context.ndim == 2 and context.shape[1] == self.cfg.context_len, \
+            f"context must be [B, {self.cfg.context_len}]"
+        if not (1 <= step_len <= self.cfg.horizon_len):
+            raise ValueError(f"step_len must be in [1, {self.cfg.horizon_len}], got {step_len}")
+        if not (pred_len > 0 and pred_len >= step_len):
+            raise ValueError(f"pred_len must be >= step_len (> 0). Got pred_len={pred_len}, step_len={step_len}")
+        if not (isinstance(n_samples, int) and n_samples >= 1):
+            raise ValueError(f"n_samples must be an integer >= 1. Got n_samples={n_samples}")
+
+        B = context.shape[0]
+        Qs = self.quantiles
+        Q = len(Qs)
+        try:
+            median_idx = Qs.index(0.5)
+        except ValueError:
+            median_idx = min(range(Q), key=lambda i: abs(Qs[i] - 0.5))
+
+        # Resolve which heads to produce (always include backbone in outputs)
+        if heads is None:
+            # Use loaded heads; backbone will be added to results automatically
+            run_keys = list(self._heads.keys())
+        else:
+            # Keep the explicit list (ignore "backbone" here; we add it below anyway)
+            run_keys = [h for h in heads if h != "backbone"]
+
+        # We'll generate per-key results; always include backbone
+        all_keys = ["backbone"] + run_keys
+
+        # Storage for per-head sample stacks: head -> [n_samples, B, pred_len]
+        samples_per_head: Dict[str, List[Tensor]] = {k: [] for k in all_keys}
+
+        # For reproducibility across heads/samples, you may wish to set seeds here externally.
+
+        # Loop over heads (including backbone)
+        for key in all_keys:
+            print(f"Current head: {key}")
+            for s in range(n_samples):
+                if (s+1) % 10 == 1:
+                    print(f"Running {key} sample: {s}")
+                # Work on CPU contexts (forecast handles device internally)
+                current_context = context.clone()
+                generated = 0
+                sample_chunks: List[Tensor] = []
+
+                while generated < pred_len:
+                    chunk_len = min(step_len, pred_len - generated)
+
+                    # Forecast for this head (or backbone)
+                    if key == "backbone":
+                        out = self.forecast(current_context, heads=[])
+                        out_k = out["backbone"]
+                    else:
+                        out = self.forecast(current_context, heads=[key])
+                        out_k = out[key]
+
+                    # Fetch a single stochastic sample and take the needed chunk
+                    if "samples" not in out_k:
+                        # Fallback: use median as a deterministic sample if not provided
+                        sample_seg = out_k["median"][:, :chunk_len].detach().cpu()
+                        print(f"samples not in out_k.keys(): {out_k.keys()}")
+                    else:
+                        sample_seg = out_k["samples"][:, :chunk_len].detach().cpu()  # [B, chunk_len]
+
+                    sample_chunks.append(sample_seg)
+
+                    # Update context: slide by chunk_len and append sample segment
+                    shifted = current_context[:, chunk_len:]                   # [B, C - chunk_len]
+                    current_context = torch.cat([shifted, sample_seg.to(current_context.dtype)], dim=1)
+
+                    # Cleanup
+                    del out, out_k, sample_seg, shifted
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                    generated += chunk_len
+
+                # Concatenate chunks to get full [B, pred_len] sample trajectory
+                sample_full = torch.cat(sample_chunks, dim=1)  # [B, pred_len]
+                samples_per_head[key].append(sample_full)
+
+                # Cleanup
+                del sample_chunks, sample_full
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        # Aggregate per key: stack [n_samples, B, pred_len], then compute quantiles/mean/median
+        results: Dict[str, Dict[str, Tensor]] = {}
+        probs = torch.tensor(Qs, dtype=torch.float32)
+
+        for key in all_keys:
+            # [S, B, L]
+            samples_stack = torch.stack(samples_per_head[key], dim=0)  # CPU
+            # [Q, B, L]
+            q_all = torch.quantile(samples_stack, probs, dim=0)
+            m_all = samples_stack.mean(dim=0)          # [B, L]
+            med_all = q_all[median_idx]                # [B, L]
+
+            results[key] = {
+                "mean": m_all,        # [B, pred_len]
+                "median": med_all,    # [B, pred_len]
+                "quantiles": q_all,   # [Q, B, pred_len]
+            }
+
+            # Optionally keep the raw MC samples (commented out to save memory)
+            # results[key]["samples_mc"] = samples_stack  # [S, B, pred_len]
+
+            # Cleanup
+            del samples_stack, q_all, m_all, med_all
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        return results

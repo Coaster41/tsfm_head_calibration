@@ -91,12 +91,12 @@ def load_test_data(
     # Split to get test template starting at forecast_date_ts
     _, test_template = split(ds, date=pd.Period(forecast_date_ts, freq=freq))
 
-    print(f"Windows: {(total_forecast_length - PDT) // stride + 1}, total length: {total_forecast_length}")
+    print(f"Windows: {(total_forecast_length - PDT) // stride}, total length: {total_forecast_length}")
 
     # Build rolling-window instances
     test_data = test_template.generate_instances(
         prediction_length=PDT,                              # steps to predict / crop
-        windows=(total_forecast_length - PDT) // stride + 1,    # number of windows
+        windows=(total_forecast_length - PDT) // stride,    # number of windows
         distance=stride,                                    # step between windows
         max_history=CTX,
     )
@@ -125,7 +125,7 @@ def parse_args():
                         help="Backbone model name for HeadForecaster.")
     parser.add_argument("--ckpt-dir", type=str, default="models",
                         help="Directory containing head checkpoints (e.g., models/{model}_{head}_head.pt).")
-    parser.add_argument("--heads", type=str, nargs="+",
+    parser.add_argument("--heads", type=str, nargs="*",
                         default=["quantiles", "studentst", "gaussian", "mixture"],
                         help="Heads to evaluate; 'backbone' is added automatically.")
     parser.add_argument("--horizon-len", type=int, required=False,
@@ -137,6 +137,9 @@ def parse_args():
     parser.add_argument("--ar-step-len", type=int, default=None,
                         help="AR step length per iteration (must be <= model horizon_len). "
                              "If omitted, defaults to model step_size if available, else min(horizon_len, pred_length).")
+    parser.add_argument("--ar-samples", type=int, default=None,
+                        help="Number of trajectories for sample-based AR. "
+                             "If omitted, defaults to quantile based ar otherwise uses ar sampling.")
     # Redundant...
     parser.add_argument("--include-backbone", action="store_true", default=True,
                         help="Include 'backbone' as a pseudo-head for baseline forecasts.")
@@ -199,6 +202,8 @@ def main():
                 ar_step_len = int(min(h, args.pred_length))
         if ar_step_len < 1:
             raise ValueError("ar-step-len must be >= 1.")
+        if (args.ar_samples != None) and (args.ar_samples < 1):
+            raise ValueError("ar-samples must be >= 1.")
         if forecaster.cfg.horizon_len is not None and ar_step_len > forecaster.cfg.horizon_len:
             raise ValueError(f"ar-step-len ({ar_step_len}) must be <= model horizon_len ({forecaster.cfg.horizon_len}).")
         print(f"AR mode enabled: pred_len={args.pred_length}, step_len={ar_step_len}")
@@ -220,12 +225,22 @@ def main():
         if args.ar:
             # Pass heads excluding 'backbone'; AR returns "backbone" as well
             req_heads = [h for h in heads if h != "backbone"]
-            out = forecaster.autoregressive_forecast(
-                context=context,
-                pred_len=args.pred_length,
-                step_len=ar_step_len,
-                heads=req_heads if len(req_heads) > 0 else None,
-            )
+            if args.ar_samples == None:
+                out = forecaster.autoregressive_forecast(
+                    context=context,
+                    pred_len=args.pred_length,
+                    step_len=ar_step_len,
+                    heads=req_heads if len(req_heads) > 0 else None,
+                )
+            else:
+                out = forecaster.autoregressive_forecast_samples(
+                    context=context,
+                    pred_len=args.pred_length,
+                    step_len=ar_step_len,
+                    n_samples=args.ar_samples,
+                    heads=req_heads if len(req_heads) > 0 else None,
+                )
+
         else:
             # Single-call forecast; pass requested heads (excluding 'backbone') to match loaded heads
             req_heads = [h for h in heads if h != "backbone"]
